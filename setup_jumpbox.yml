@@ -1,0 +1,205 @@
+# My dream jumpbox featuring heaps utils and creature comforts
+- name: setup jumpbox
+  hosts: jumpbox
+  become: true
+  become_user: root
+  vars:
+    cp_major: "7.5"
+    cp_version: "{{ cp_major }}.3"
+    confluent_dir: "/usr/local/confluent-{{ cp_version }}"
+    confluent_symlink: "/usr/local/confluent"
+    confluent_user: confluent
+    confluent_group: "{{ confluent_user }}"
+    helm_version: "3.14.0"
+
+  tasks:
+    - name: "Ensure group: {{ confluent_group }}"
+      ansible.builtin.group:
+        name: "{{ confluent_group }}"
+        state: present
+
+    - name: "Create a user: {{ confluent_user }}"
+      ansible.builtin.user:
+        name: "{{ confluent_user }}"
+        comment: "{{ confluent_user }}"
+        group: "{{ confluent_group }}"
+
+    - name: "adding existing user '{{ ansible_user }}' to group {{ confluent_user }}"
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: "{{ confluent_group }}"
+        append: yes
+
+    - name: copy the shell prompt script
+      ansible.builtin.copy:
+        src: scripts/bash_prompt.sh
+        dest: /usr/local/bin/bash_prompt.sh
+        mode: 0755
+        owner: root
+        group: root
+
+    - name: Install Docker
+      ansible.builtin.script: ./scripts/install_docker.sh
+
+    - name: install packages
+      ansible.builtin.apt:
+        name:
+          - openjdk-11-jdk-headless
+          - kafkacat
+          - jq
+          - unzip
+          - golang-go
+          - dos2unix
+          - git
+        update_cache: yes
+    - name: download and extract confluent platform
+      ansible.builtin.unarchive:
+        src: https://packages.confluent.io/archive/{{ cp_major }}/confluent-{{ cp_version }}.tar.gz
+        dest: /usr/local
+        owner: root
+        group: "{{ confluent_group }}"
+        remote_src: yes
+        creates: "{{ confluent_dir }}"
+
+    - name: "symlink {{ confluent_dir }} -> {{ confluent_symlink }}"
+      ansible.builtin.file:
+        src: "{{ confluent_dir }}"
+        dest: "{{ confluent_symlink }}"
+        state: link
+
+
+    - name: "add CONFLUENT_HOME environment variable"
+      ansible.builtin.lineinfile:
+        path: "/etc/bash.bashrc"
+        regexp: '^export CONFLUENT_HOME=.*$'
+        line: "export CONFLUENT_HOME={{ confluent_symlink}}"
+
+    - name: CP bash auto completion
+      ansible.builtin.command:
+        cmd: bash -c "{{ confluent_symlink }}/bin/confluent completion bash > /etc/bash_completion.d/confluent"
+        creates: /etc/bash_completion.d/confluent
+
+    - name: "confluent auto complete"
+      ansible.builtin.lineinfile:
+        path: "/etc/bash.bashrc"
+        line: "source /etc/bash_completion.d/confluent"
+
+    - name: "kubectl autocomplete"
+      ansible.builtin.lineinfile:
+        path: "/etc/bash.bashrc"
+        line: "source <(kubectl completion bash)"
+
+    - name: "helm autocomplete"
+      ansible.builtin.lineinfile:
+        path: "/etc/bash.bashrc"
+        line: "source <(helm completion bash)"
+
+    - name: "bash prompt"
+      ansible.builtin.lineinfile:
+        path: "/home/ubuntu/.bashrc"
+        line: "source /usr/local/bin/bash_prompt.sh"
+
+    - name: Get latest kubectl version
+      uri:
+        url: https://dl.k8s.io/release/stable.txt
+        return_content: yes
+      register: version
+
+    - name: Download the latest kubectl release
+      ansible.builtin.uri:
+        url: https://dl.k8s.io/release/{{ version.content }}/bin/linux/amd64/kubectl
+        dest: /usr/local/bin/kubectl
+        creates: /usr/local/bin/kubectl
+
+    - name: "chmod kubectl"
+      ansible.builtin.command:
+        cmd: chmod +x /usr/local/bin/kubectl
+
+
+    - name: Download helm archive
+      ansible.builtin.get_url:
+        url: https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz
+        checksum: sha256:https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz.sha256sum
+        dest: /tmp
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Unarchive helm binary
+      ansible.builtin.unarchive:
+        src: /tmp/helm-v{{ helm_version }}-linux-amd64.tar.gz
+        dest: /usr/local/bin
+        extra_opts: "--strip-components=1"
+        owner: root
+        group: root
+        mode: 0755
+        remote_src: true
+        creates: /usr/local/bin/helm
+
+    - name: Download aws cli
+      ansible.builtin.get_url:
+        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+        dest: /tmp/awscliv2.zip
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Unarchive aws cli
+      ansible.builtin.unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp
+        owner: root
+        group: root
+        mode: 0755
+        remote_src: true
+
+    - name: "install aws cli"
+      ansible.builtin.command:
+        cmd: /tmp/aws/install
+        creates: /usr/local/bin/aws
+
+    - name: download istioctl
+      ansible.builtin.uri:
+        url: https://istio.io/downloadIstioctl
+        dest: /tmp/downloadIstioctl
+        mode: 0755
+        follow_redirects: all
+        creates: /tmp/downloadIstioctl
+
+    - name: install istio
+      ansible.builtin.command:
+        cmd: /tmp/downloadIstioctl
+        creates: "/home/ubuntu/.istioctl/bin/istioctl"
+      become_user: ubuntu
+
+    - name: "add CP and istio to path"
+      ansible.builtin.lineinfile:
+        path: "/etc/bash.bashrc"
+        regexp: '^export PATH=.*$'
+        line: "export PATH={{ confluent_symlink}}/bin:~/.istioctl/bin:~/go/bin:$PATH"
+
+    - name: "helm autocomplete"
+      ansible.builtin.lineinfile:
+        path: "/etc/bash.bashrc"
+        line: "source <(istioctl completion bash)"
+
+    - name: Install snaps
+      community.general.snap:
+        name:
+          - yq
+
+    - name: Log directory + access
+      ansible.builtin.file:
+        path: /usr/local/confluent/logs
+        state: directory
+        mode: '0775'
+        owner: "root"
+        group: "{{ confluent_group }}"
+
+    - name: Install pup html processor (like jq)
+      ansible.builtin.command:
+        cmd: go install github.com/ericchiang/pup@latest
+        creates: /home/ubuntu/go/bin/pup
+      become_user: ubuntu
+
+
